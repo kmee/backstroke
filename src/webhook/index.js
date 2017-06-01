@@ -80,7 +80,7 @@ export default function webhook(gh, link, pageSize=100, botInstance=false) {
     function getForks(page) {
       let allForks = [];
       return gh.reposGetForks({
-        user, repo, page,
+        owner: user, repo, page,
         per_page: pageSize,
       }).then(forks => {
         // Act on each fork, and add each's response to `forkGroup`.
@@ -184,12 +184,8 @@ export function createPullRequest(inst, provider, upstreamRepoModel, childRepoMo
 
   switch (provider) {
     case 'github':
-      // console.ephemeralBranchlog("Create pull request on", childUser, childRepo);
-      // console.log("  base:", childRepoModel.branch);
-      // console.log("  head:", upstreamUser, upstreamRepoModel.branch);
-      // break;
       return inst.pullRequestsCreate({
-        user: childUser, repo: childRepo,
+        owner: childUser, repo: childRepo,
         title: generatePullRequestTitle(realUpstreamUser, realUpstreamRepo),
         head: `${upstreamUser}:${upstreamRepoModel.branch}`,
         base: childRepoModel.branch,
@@ -199,6 +195,7 @@ export function createPullRequest(inst, provider, upstreamRepoModel, childRepoMo
           // if an ephemeral repo wasn't generated, this should be falsey
           upstreamRepo === realUpstreamRepo ? false : upstreamRepo
         ),
+        maintainer_can_modify: false,
       });
     default:
       throw new Error(`No such provider ${provider}`);

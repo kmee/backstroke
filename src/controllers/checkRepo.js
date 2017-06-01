@@ -6,12 +6,13 @@ export function checkRepo(req, res) {
 
     // Get repo details, and associated branches
     return gh.reposGet({
-      user: req.params.user,
+      owner: req.params.user,
       repo: req.params.repo,
     }).then(repoData => {
       let branches = gh.reposGetBranches({
-        user: req.params.user,
+        owner: req.params.user,
         repo: req.params.repo,
+        per_page: 100, // NOTE: this shouldn't be hardcoded, but will fix the issue for now.
       });
 
       return Promise.all([repoData.private, repoData.fork, branches]);
