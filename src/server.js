@@ -1,126 +1,246 @@
 import express from 'express';
-let app = express();
-app.set('view engine', 'ejs');
-app.use(express.static('build'));
+const app = express();
+
+// ----------------------------------------------------------------------------
+// Log requests as they are received.
+// ----------------------------------------------------------------------------
+import morgan from 'morgan';
+app.use(morgan((tokens, req, res) => {
+  return [
+    tokens.method(req, res),
+    tokens.url(req, res),
+    tokens.status(req, res),
+    tokens.res(req, res, 'content-length'), '-',
+    tokens['response-time'](req, res), 'ms',
+    // Add request id to logs
+    req.headers['x-request-id'] ? `id=>${req.headers['x-request-id']}` : null,
+  ].join(' ');
+}));
+
+// ----------------------------------------------------------------------------
+// Define Cross Origin Resource Sharing rules.
+// ----------------------------------------------------------------------------
+import cors from 'cors';
+const corsHandler = cors({
+  origin(origin, callback) {
+    if (!origin || origin.match(new RegExp(process.argv.CORS_ORIGIN_REGEXP, 'i'))) {
+      callback(null, true);
+    } else {
+      callback(null, false);
+    }
+  },
+  credentials: true,
+});
+app.use(corsHandler);
+app.options('*', corsHandler);
+
+// Polyfill promise with bluebird.
 import Promise from 'bluebird';
+global.Promise = Promise;
 
-import whoami from 'controllers/whoami';
-import * as links from 'controllers/links';
-import {checkRepo} from 'controllers/checkRepo';
-import webhook from 'controllers/webhook';
-import webhookOld from 'controllers/webhookOld';
-import {getSubscriptionInformation, updatePaidLinks, addPaymentToUser} from 'controllers/payments';
-
-import isLinkPaid from 'helpers/isLinkPaid';
-import {addWebhooksForLink, removeOldWebhooksForLink} from 'helpers/addWebhooksForLink';
-
-// ----------------------------------------------------------------------------
-// Mongo stuff
-// ----------------------------------------------------------------------------
-import mongoose from 'mongoose';
-mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI);
-mongoose.Promise = Promise;
-import User from 'models/User';
-import Link from 'models/Link';
+// How should we redirect to other origins? If unset, add some mocks to this app to use as those
+// redirects.
+const APP_URL = process.env.APP_URL || '/mocks/app';
+if (APP_URL === '/mocks/app') {
+  app.get('/mocks/app', (req, res) => res.send('This would redirect to the app when deployed.'));
+}
+const ROOT_URL = process.env.ROOT_URL || '/mocks/root';
+if (APP_URL === '/mocks/root') {
+  app.get('/mocks/root', (req, res) => res.send('This would redirect to the main site when deployed.'));
+}
+app.get('/', (req, res) => res.sendFile(__dirname+'/root-file.html'));
 
 // ----------------------------------------------------------------------------
-// Set up session store
+// Routes and helpers for the routes
 // ----------------------------------------------------------------------------
-const MongoStore = require('connect-mongo')(session),
-mongoStore = new MongoStore({mongooseConnection: mongoose.connection});
+import route from './helpers/route';
+
+import whoami from './routes/whoami';
+import checkRepo from './routes/checkRepo';
+
+import manual from './routes/webhook/manual';
+import status from './routes/webhook/status';
+import { isCollaboratorOfRepository } from './routes/links/update/helpers';
+
+import linksList from './routes/links/list';
+import linksGet from './routes/links/get';
+import linksGetOperations from './routes/links/get-operations';
+import linksCreate from './routes/links/create';
+import linksDelete from './routes/links/delete';
+import linksUpdate from './routes/links/update';
+import linksEnable from './routes/links/enable';
+
+import { Link, User, WebhookQueue, WebhookStatusStore } from './models';
+
+// ----------------------------------------------------------------------------
+// Use sentry in production to report errors
+// ----------------------------------------------------------------------------
+import Raven from 'raven';
+if (process.env.SENTRY_CONFIG) {
+  Raven.config(process.env.SENTRY_CONFIG).install();
+}
 
 // ----------------------------------------------------------------------------
 // Passport stuff
 // ----------------------------------------------------------------------------
 import passport from 'passport';
 import session from 'express-session';
-import strategy from 'auth/strategy';
-import serialize from 'auth/serialize';
+import fileStore from 'session-file-store';
+const FileStore = fileStore(session);
+import strategy from './auth/strategy';
+import serialize from './auth/serialize';
 app.use(session({
   secret: process.env.SESSION_SECRET,
-  store: mongoStore,
+  saveUninitialized: true,
+  resave: true,
 }));
 app.use(passport.initialize());
 app.use(passport.session());
 passport.use(strategy(User));
 serialize(User, passport);
 
+// ----------------------------------------------------------------------------
+// User authentication flow routes
+// ----------------------------------------------------------------------------
 import bodyParser from 'body-parser';
-import morgan from 'morgan';
-app.use(morgan('tiny'));
 
 // Authenticate a user
 app.get('/setup/login', passport.authenticate('github', {
   successRedirect: '/',
-  failureRedirect: '/setup/login',
   scope: ["repo", "write:repo_hook", "user:email"],
 }));
 app.get('/setup/login/public', passport.authenticate('github', {
   successRedirect: '/',
-  failureRedirect: '/setup/login',
   scope: ["public_repo", "write:repo_hook", "user:email"],
 }));
 
 // Second leg of the auth
 app.get("/auth/github/callback", passport.authenticate("github", {
-  failureRedirect: '/setup/login',
+  failureRedirect: '/setup/failed',
 }), (req, res) => {
-  res.redirect('/#/links'); // on success
+  res.redirect(APP_URL); // on success
+});
+
+// Second leg of the auth
+app.get("/auth/github-public/callback", passport.authenticate("github-public", {
+  failureRedirect: '/setup/failed',
+}), (req, res) => {
+  res.redirect(APP_URL); // on success
 });
 
 app.get('/logout', (req, res) => {
   req.logout();
-  res.redirect('/');
+  res.redirect(ROOT_URL);
 });
 
-// identify the currently logged in user
-app.get('/api/v1/whoami', whoami);
+import analyticsForRoute from './helpers/mixpanel';
+// A utility function to check if a user is authenticated, and if so, return
+// the authenticated user. Otherwise, this function will throw an error
+function assertLoggedIn(req, res, next) {
+  if (req.isAuthenticated()) {
+    next();
+  } else {
+    res.status(401).send({error: 'Not authenticated.'});
+  }
+}
 
-// get all links
-app.get('/api/v1/links', bodyParser.json(), links.index.bind(null, Link));
+import GitHubApi from 'github';
+function constructor(github) {
+  return {
+    reposGet: Promise.promisify(github.repos.get),
+    reposGetBranch: Promise.promisify(github.repos.getBranch),
+    reposGetBranches: Promise.promisify(github.repos.getBranches),
+    reposGetForks: Promise.promisify(github.repos.getForks),
+    reposFork: Promise.promisify(github.repos.fork),
+    reposEdit: Promise.promisify(github.repos.edit),
+    reposDelete: Promise.promisify(github.repos['delete']),
+    reposMerge: Promise.promisify(github.repos.merge),
+    reposAddCollaborator: Promise.promisify(github.repos.addCollaborator),
 
-// GET a given link
-app.get('/api/v1/links/:id', bodyParser.json(), links.get.bind(null, Link));
+    pullRequestsCreate: Promise.promisify(github.pullRequests.create),
+    pullRequestsGetAll: Promise.promisify(github.pullRequests.getAll),
+    pullRequestsMerge: Promise.promisify(github.pullRequests.merge),
+
+    reposCreateHook: Promise.promisify(github.repos.createHook),
+    reposDeleteHook: Promise.promisify(github.repos.deleteHook),
+    reposFork: Promise.promisify(github.repos.fork),
+    reposGetCollaborators: Promise.promisify(github.repos.getCollaborators),
+    searchIssues: Promise.promisify(github.search.issues),
+  };
+}
+
+// Authorize the bot.
+const bot = new GitHubApi({});
+bot.authenticate({
+  type: "oauth",
+  token: process.env.GITHUB_TOKEN,
+});
+
+// An express middleware that adds a github api instance to the request for the currently
+// authenticated user. If no user is logged in, the property isn't set.
+function authedGithubInstance(req, res, next) {
+  req.github = {};
+
+  // Add the bot api instance to the request.
+  req.github.bot = constructor(bot);
+
+  // If a user is logged in, create an add a user instance.
+  if (req.user) {
+    const github = new GitHubApi({});
+    github.authenticate({
+      type: "oauth",
+      token: req.user.accessToken,
+    });
+    
+    req.github.user = constructor(github);
+  }
+  return next();
+}
+
+// ----------------------------------------------------------------------------
+// User authentication flow routes
+// ----------------------------------------------------------------------------
+
+// Redirect calls to `/api/v1` => `/v1`
+app.all(/^\/api\/v1\/.*$/, (req, res) => res.redirect(req.url.replace(/^\/api/, '')));
+
+// Identify the currently logged in user
+app.get('/v1/whoami', whoami);
+
+// GET all links
+app.get('/v1/links', bodyParser.json(), assertLoggedIn, analyticsForRoute, route(linksList, [Link]));
+
+// GET a single link
+app.get('/v1/links/:id', bodyParser.json(), assertLoggedIn, analyticsForRoute, route(linksGet, [Link]));
+
+// GET all operations associated with a single link
+app.get('/v1/links/:id/operations', bodyParser.json(), assertLoggedIn, analyticsForRoute, route(linksGetOperations, [Link, WebhookStatusStore]));
+
+// Create a new link
+app.post('/v1/links', bodyParser.json(), assertLoggedIn, analyticsForRoute, route(linksCreate, [Link]));
 
 // delete a link
-app.delete('/api/v1/links/:id', links.del.bind(null, Link, User, updatePaidLinks));
-
-// return the branches for a given repo
-app.get('/api/v1/repos/:provider/:user/:repo', bodyParser.json(), checkRepo);
-
-// create a new link
-app.post('/api/v1/links', bodyParser.json(), links.create.bind(null, Link));
+app.delete('/v1/links/:id', assertLoggedIn, analyticsForRoute, route(linksDelete, [Link]));
 
 // POST link updates
-app.post('/api/v1/links/:linkId', bodyParser.json(),
-  links.update.bind(null, Link, User, isLinkPaid, addWebhooksForLink, removeOldWebhooksForLink, updatePaidLinks));
+app.post('/v1/links/:linkId', bodyParser.json(), assertLoggedIn, analyticsForRoute, route(linksUpdate, [Link, isCollaboratorOfRepository]));
 
-// get the info to the currently subscribed plan
-app.get('/api/v1/subscribed', getSubscriptionInformation);
+// enable or disable a link
+app.post('/v1/links/:linkId/enable', bodyParser.json(), assertLoggedIn, analyticsForRoute, route(linksEnable, [Link]));
 
-// add a card to an account
-// body: {"source": "tok_stripetoken", "email": "billing@email.com"}
-app.post('/api/v1/payments', bodyParser.json(), addPaymentToUser.bind(null, User));
+// return the branches for a given repo
+app.get('/v1/repos/:provider/:user/:repo', bodyParser.json(), assertLoggedIn, authedGithubInstance, checkRepo);
 
-// enable or disable a repository
-app.post('/api/v1/link/:linkId/enable', bodyParser.json(), links.enable.bind(null, Link, User, updatePaidLinks));
+// the new webhook route - both the condensed verson meant to be called by a user and the interal
+// variant that follows REST a bit closer.
+app.all('/_:linkId', route(manual, [Link, User, WebhookQueue]));
+app.post('/v1/links/:linkId/sync', assertLoggedIn, route(manual, [Link, User, WebhookQueue]));
 
-// the old webhook route
-// This parses the body of the request to get most of its data.
-app.post("/", bodyParser.json(), webhookOld);
-app.route("/ping/github/:user/:repo").get((req, res) => {
-  res.redirect(`https://github.com/${req.params.user}/${req.params.repo}`);
-}).post(webhook);
+// check to see how a link operation is doing after it has been kicked off
+app.get('/v1/operations/:operationId', route(status, [WebhookStatusStore]));
 
-// the new webhook route
-// No body parsing, all oauth-based
-app.all('/_:linkId', webhook.bind(null, Link));
-
-// For letsencrypt
-app.get('/.well-known/acme-challenge/:id', (req, res) =>
-  res.status(200).send(process.env.LETSENCRYPT_ID)
-);
-
-let port = process.env.PORT || 8001;
-app.listen(port);
-console.log("Listening on port", port, "...");
+if (require.main === module) {
+  const port = process.env.PORT || 8001;
+  app.listen(port);
+  console.log('Listening on port', port);
+}
